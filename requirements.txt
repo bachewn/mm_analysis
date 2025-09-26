@@ -1,0 +1,8 @@
+pandas
+openpyxl
+typer[all]
+fastapi
+uvicorn[standard]
+pydantic
+streamlit
+matplotlib

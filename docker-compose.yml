@@ -1,0 +1,30 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - MM_DATA_PATH=/data/df_first_round_all_years.xlsx
+      - MM_LINES_PATH=/data/first_round_lines.xlsx
+    volumes:
+      - "C:/Users/888/Desktop/2024 NCAA Stats/df_first_round_all_years.xlsx:/data/df_first_round_all_years.xlsx"
+      - "C:/Users/888/Desktop/2024 NCAA Stats/first_round_lines.xlsx:/data/first_round_lines.xlsx"
+    ports:
+      - "8000:8000"
+    command: uvicorn fastapi_app:app --host 0.0.0.0 --port 8000
+
+  ui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - MM_DATA_PATH=/data/df_first_round_all_years.xlsx
+      - MM_LINES_PATH=/data/first_round_lines.xlsx
+    volumes:
+      - "C:/Users/888/Desktop/2024 NCAA Stats/df_first_round_all_years.xlsx:/data/df_first_round_all_years.xlsx"
+      - "C:/Users/888/Desktop/2024 NCAA Stats/first_round_lines.xlsx:/data/first_round_lines.xlsx"
+
+    ports:
+      - "8501:8501"
+    command: streamlit run streamlit_app.py --server.port 8501 --server.address 0.0.0.0
+
