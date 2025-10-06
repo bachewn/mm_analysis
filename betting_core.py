@@ -17,6 +17,7 @@ TEAM_ALIASES = {
     "SMC": "Saint Mary's",
 }
 
+# --- Replace canonicalize_team with this version ---
 def canonicalize_team(name: str) -> str:
     """
     Light canonicalization for a single team label:
@@ -103,25 +104,59 @@ def parse_american_odds(cell: str):
     team = canonicalize_team(team_raw)
     return (team, odds_raw, source)
 
-def parse_point_spread(cell: str):
-    """
-    Extract (favorite_team, spread_float). Example:
-      'ISU −14.5' → ('Iowa State', -14.5)  # negative means favorite giving points
-      'Marquette -3.5' → ('Marquette', -3.5)
-    """
-    if cell is None or (isinstance(cell, float) and math.isnan(cell)):
+def parse_score(cell: str):
+    """Parse '82–55' or '82-55' (en dash/em dash/hyphen) -> (82, 55)."""
+    if cell is None or (isinstance(cell, float) and pd.isna(cell)):
         return (None, None)
     s = str(cell).strip().replace("–", "-").replace("—", "-")
-    m = re.match(r"(.+?)\s*([+-]?\d+(\.\d+)?)\s*$", s)
+    m = re.match(r"^\s*(\d+)\s*-\s*(\d+)\s*$", s)
     if not m:
         return (None, None)
+    return (int(m.group(1)), int(m.group(2)))
+
+
+def parse_point_spread(cell: str):
+    """
+    Return (favorite_team, spread_float).
+
+    - Accepts 'Clemson -8.5', 'Clemson −8.5', 'Clemson 8.5' (rare exports),
+      or malformed 'Clemson -  8.5' / 'Clemson -' + '8.5' style strings.
+    - Strips any trailing '-', '+', '−', '–', '—' after the team name.
+    - Final convention: favorite LAYS points -> spread is NEGATIVE.
+    """
+    if cell is None or (isinstance(cell, float) and pd.isna(cell)):
+        return (None, None)
+
+    s = str(cell).strip()
+    # Normalize dash variants to a simple hyphen to make regex stable
+    s = s.replace("−", "-").replace("–", "-").replace("—", "-")
+
+    # Typical formats we support:
+    #   'Team -8.5'  'Team +8.5'  'Team 8.5'  'Team - 8.5'  'Team-8.5'
+    m = re.match(r"(.+?)\s*[-+]?\s*([0-9]+(?:\.[0-9]+)?)\s*$", s)
+    if not m:
+        # Last-ditch: 'Team -' with number elsewhere (highly malformed)
+        m2 = re.match(r"(.+?)\s*[-+]\s*$", s)
+        if m2:
+            team_raw = m2.group(1).strip()
+            return (canonicalize_team(team_raw), None)
+        return (None, None)
+
     team_raw = m.group(1).strip()
     spread = float(m.group(2))
-    # Convention: favorite has negative spread; if positive provided, make it negative (favorite)
-    # Some books use "Team +3.5 (underdog)"—we keep the sign as-is (user can interpret),
-    # but most first-round lines will show favorite with negative.
+
+    # If the team token ends with any sign, strip it
+    while team_raw and team_raw[-1] in ("-", "+", "−", "–", "—"):
+        team_raw = team_raw[:-1].strip()
+
     team = canonicalize_team(team_raw)
+
+    # Enforce sign convention at parse time:
+    # favorite should lay points, so store as NEGATIVE
+    spread = -abs(spread)
+
     return (team, spread)
+
 
 def normalize_team_token(name: str) -> str:
     """
@@ -229,9 +264,31 @@ def load_betting_sheet(path: str, year_col: str = "Year") -> pd.DataFrame:
     df["ML_Dog_Team"] = reconciled["ML_Dog_Team"]
     df["ML_Dog_Odds"] = reconciled["ML_Dog_Odds"]
 
+    # Enforce spread sign convention: favorite lays points => negative spread value
+    # If Spread_Fav_Team is known and spread is positive, flip sign.
+    def normalize_spread_sign(row):
+        sp = row["Spread"]
+        if pd.isna(sp): return sp
+        # If we have a favorite team, ensure negative number
+        if pd.notna(row["Spread_Fav_Team"]):
+            return -abs(float(sp))
+        # Otherwise leave as-is (rare; can happen on malformed rows)
+        return float(sp)
+
+    df["Spread"] = df.apply(normalize_spread_sign, axis=1)
+
     # Implied probabilities
     df["ML_Fav_Implied"] = df["ML_Fav_Odds"].map(american_to_implied_prob)
     df["ML_Dog_Implied"] = df["ML_Dog_Odds"].map(american_to_implied_prob)
+
+        # Scores (TeamA first, TeamB second)
+    if "Score" in df.columns:
+        a_pts, b_pts = zip(*df["Score"].map(parse_score))
+        df["TeamA_Points"] = list(a_pts)
+        df["TeamB_Points"] = list(b_pts)
+    else:
+        df["TeamA_Points"] = pd.NA
+        df["TeamB_Points"] = pd.NA
 
     # Clean temp cols
     df = df.drop(columns=["_A_norm", "_B_norm"])
@@ -249,6 +306,7 @@ def load_betting_sheet(path: str, year_col: str = "Year") -> pd.DataFrame:
         "Spread_Fav_Team", "Spread",
         "ML_Fav_Team", "ML_Fav_Odds", "ML_Fav_Implied",
         "ML_Dog_Team", "ML_Dog_Odds", "ML_Dog_Implied",
+        "TeamA_Points", "TeamB_Points",
         "ML_Source",
     ]
     return df[keep]
@@ -270,6 +328,49 @@ def attach_betting_to_games(games_df: pd.DataFrame, lines_df: pd.DataFrame) -> p
         how="left",
         suffixes=("", "_lines"),
     )
+
+        # Fallback pass: normalized key for rows still missing
+    # Fallback pass: normalized key for rows still missing
+    missing_mask = merged["ML_Fav_Odds"].isna() & merged["ML_Dog_Odds"].isna() & merged["Spread"].isna()
+    if missing_mask.any():
+        g_missing = merged.loc[missing_mask].copy()
+
+        # Ensure we have norm_matchup_key on the left (recompute if missing)
+        if "norm_matchup_key" not in g_missing.columns or g_missing["norm_matchup_key"].isna().any():
+            g_missing["norm_matchup_key"] = [
+                build_norm_matchup_key(a, b)
+                for a, b in zip(g_missing["TeamName"], g_missing["OpponentName"])
+            ]
+
+        # Only the columns we need from the right
+        right_cols = [
+            "Year", "norm_matchup_key",
+            "Spread_Fav_Team", "Spread",
+            "ML_Fav_Team", "ML_Fav_Odds", "ML_Fav_Implied",
+            "ML_Dog_Team", "ML_Dog_Odds", "ML_Dog_Implied",
+            "TeamA_Points", "TeamB_Points",
+            "ML_Source",
+        ]
+        rr = lines_df[right_cols].copy()
+
+        alt = g_missing.merge(
+            rr, how="left",
+            on=["Year", "norm_matchup_key"],
+            suffixes=("", "_alt")
+        )
+
+        # Fill only where empty
+        fill_cols = [
+            "Spread_Fav_Team", "Spread",
+            "ML_Fav_Team", "ML_Fav_Odds", "ML_Fav_Implied",
+            "ML_Dog_Team", "ML_Dog_Odds", "ML_Dog_Implied",
+            "TeamA_Points", "TeamB_Points",
+            "ML_Source",
+        ]
+        for col in fill_cols:
+            merged.loc[missing_mask, col] = merged.loc[missing_mask, col].combine_first(alt[col])
+
+
 
     # Determine, from the row's perspective, the row's moneyline odds
     def row_ml_odds(row):
@@ -303,5 +404,47 @@ def attach_betting_to_games(games_df: pd.DataFrame, lines_df: pd.DataFrame) -> p
             return -100.0
 
     merged["Row_ML_Profit_$100"] = merged.apply(row_profit_if_bet_100, axis=1)
+
+    # ----- ATS (Against the Spread) -----
+    # Determine row's team score and opponent score from TeamA/TeamB points
+    def row_points(row):
+        t = canonicalize_team(row["TeamName"])
+        if pd.notna(row.get("TeamA")) and pd.notna(row.get("TeamA_Points")):
+            if t == row["TeamA"]:
+                return row["TeamA_Points"], row["TeamB_Points"]
+            if t == row["TeamB"]:
+                return row["TeamB_Points"], row["TeamA_Points"]
+        return (pd.NA, pd.NA)
+
+    pts = merged.apply(row_points, axis=1, result_type="expand")
+    merged["Row_Team_Points"] = pts[0]
+    merged["Row_Opp_Points"] = pts[1]
+
+    # Ensure spread stored is negative for favorite (done in loader), then compute row-specific spread:
+    # If the row's team IS the favorite, row_spread = Spread (negative).
+    # Else row_spread = -Spread (positive points received).
+    def row_spread_value(row):
+        sp = row.get("Spread", pd.NA)
+        fav = row.get("Spread_Fav_Team", pd.NA)
+        if pd.isna(sp) or pd.isna(fav):
+            return pd.NA
+        if canonicalize_team(row["TeamName"]) == fav:
+            return float(sp)  # negative
+        else:
+            return -float(sp)  # positive (dog gets points)
+
+    merged["Row_Spread"] = merged.apply(row_spread_value, axis=1)
+
+    def ats_result(row):
+        rp, op, rs = row.get("Row_Team_Points"), row.get("Row_Opp_Points"), row.get("Row_Spread")
+        if any(pd.isna(x) for x in [rp, op, rs]):
+            return pd.NA
+        adj_margin = (rp - op) + rs
+        if adj_margin > 0:  return "ATS Win"
+        if adj_margin == 0: return "Push"
+        return "ATS Loss"
+
+    merged["Row_ATS_Result"] = merged.apply(ats_result, axis=1)
+
 
     return merged

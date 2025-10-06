@@ -220,12 +220,12 @@ with st.sidebar:
     sel_years = st.multiselect("Years", years_available, default=years_available)
     pace_diff = st.slider("Max Pace Differential", min_value=0.0, max_value=12.0, value=3.0, step=0.5)
     require_net = st.checkbox(
-        "Require NET condition",
+        "Require Strength of Schedule (SoS) condition",
         value=True,
         help=(
-            "When ON: Higher-seed metric requires NET_Diff > 0 on the higher-seed row. "
-            "Lower-seed metric requires the higher seed's NET_Diff < 0 (i.e., NET_Diff > 0 on the lower-seed row). "
-            "When OFF: NET condition is not applied."
+            "When ON: Higher-seed metric requires SoS > 0 on the higher-seed row. "
+            "Lower-seed metric requires the higher seed's SoS < 0 (i.e., SoS > 0 on the lower-seed row). "
+            "When OFF: SoS condition is not applied."
         ),
     )
     # NEW: optional advanced filters (off by default)
@@ -293,10 +293,18 @@ if view == "detail" and detail_mode in {"higher", "lower"} and detail_year is no
         disp["Game"] = disp.apply(game_label, axis=1)
         disp["Pick"] = disp["TeamName"]
         disp["Result"] = disp["Team_Won"].map(lambda x: "Win ✅" if x == 1 else "Loss ❌")
-        disp_cols = ["Year", "Game", "Pick", "Result", "NET_Diff", "Pace_Diff",    
-                     "Spread_Fav_Team", "Spread", "ML_Fav_Team", "ML_Fav_Odds",
-                     "ML_Dog_Team", "ML_Dog_Odds",
-                     "Row_ML_Odds", "Row_ML_Implied", "Row_ML_Profit_$100"]
+        disp_cols = [
+            "Year", "Game", "Pick", "Result",
+            "NET_Diff", "Pace_Diff",
+            # Betting:
+            "Spread_Fav_Team", "Spread",
+            "ML_Fav_Team", "ML_Fav_Odds",
+            "ML_Dog_Team", "ML_Dog_Odds",
+            "Row_ML_Odds", "Row_ML_Implied", "Row_ML_Profit_$100",
+            # Scores + ATS
+            "Row_Team_Points", "Row_Opp_Points", "Row_Spread", "Row_ATS_Result",
+        ]
+
         present = [c for c in disp_cols if c in disp.columns]
         st.dataframe(disp[present].sort_values(by=["Result","Game"], ascending=[True,True]).reset_index(drop=True), width="stretch")
         st.download_button("Download detailed results (CSV)", data=disp[present].to_csv(index=False), file_name=f"{detail_mode}_detail_{detail_year}.csv", mime="text/csv")
@@ -377,20 +385,71 @@ ax.set_xlabel("Year"); ax.set_ylabel("Win %"); ax.set_ylim(0, 100); ax.legend()
 st.pyplot(fig)
 
 # Seed vs Seed matrix from advanced-filtered df (higher-seed perspective)
-tmp = df_adv.copy()
-tmp["Pace_Diff"] = (tmp["Team_Pace"] - tmp["Opp_Pace"]).abs()
-base_mask = (tmp["Pace_Diff"] <= pace_diff) & (tmp["Team_Seed"] < tmp["Opp_Seed"])
-mask = base_mask & (tmp["NET_Diff"] > 0) if require_net else base_mask
-f_high = tmp[mask]
-if sel_years: f_high = f_high[f_high["Year"].isin(sel_years)]
+# Seed vs Seed matrix from advanced-filtered df (higher-seed perspective)
+# Use betting-enriched df if available so we can compute ATS
+tmp = (df_with_lines.copy() if 'df_with_lines' in locals() and isinstance(df_with_lines, pd.DataFrame)
+       else df_adv.copy())
 
-seed_mat = (f_high.groupby(["Team_Seed","Opp_Seed"]).agg(n=("Team_Won","size"), wins=("Team_Won","sum")).assign(pct=lambda d: d["wins"]/d["n"]*100.0).reset_index())
-st.subheader("Seed vs Seed — Higher-Seed Perspective (filtered)")
-st.caption("Rows: higher seed; Cols: lower seed. pct = higher seed win %.")
+tmp["Pace_Diff"] = (tmp["Team_Pace"] - tmp["Opp_Pace"]).abs()
+base_mask = (tmp["Pace_Diff"] <= pace_diff) & (tmp["Team_Seed"] < tmp["Opp_Seed"])  # higher-seed rows only
+mask = (base_mask & (tmp["NET_Diff"] > 0)) if require_net else base_mask
+f_high = tmp[mask]
+if sel_years:
+    f_high = f_high[f_high["Year"].isin(sel_years)]
+
+# --- Win % matrix (straight-up, higher-seed perspective) ---
+seed_mat = (
+    f_high.groupby(["Team_Seed", "Opp_Seed"])
+    .agg(n=("Team_Won", "size"), wins=("Team_Won", "sum"))
+    .assign(pct=lambda d: d["wins"] / d["n"] * 100.0)
+    .reset_index()
+)
 pivot_pct = seed_mat.pivot(index="Team_Seed", columns="Opp_Seed", values="pct").sort_index().sort_index(axis=1)
 pivot_n   = seed_mat.pivot(index="Team_Seed", columns="Opp_Seed", values="n").sort_index().sort_index(axis=1)
-t1, t2 = st.tabs(["Win % matrix", "Sample size (n) matrix"])
-with t1: st.dataframe(pivot_pct.style.format("{:.1f}"), width="stretch")
-with t2: st.dataframe(pivot_n.fillna(0).astype(int), width="stretch")
 
-st.caption("Optional filters apply to the **team row**: turnover/rebound/eFG% differentials are computed as Team − Opponent (or absolute if selected). Pace and NET rules follow your toggles.")
+st.subheader("Seed vs Seed — Higher-Seed Perspective (filtered)")
+st.caption("Rows: higher seed; Cols: lower seed. pct = higher seed win %. ATS: Against-the-spread (point-spread)")
+
+t1, t2, t3 = st.tabs(["Win % matrix", "Sample size (n) matrix", "ATS % matrix"])
+
+with t1:
+    st.dataframe(pivot_pct.style.format("{:.1f}"), use_container_width=True)
+
+with t2:
+    st.dataframe(pivot_n.fillna(0).astype(int), use_container_width=True)
+
+with t3:
+    # ATS matrix: require Row_ATS_Result (from betting lines attachment)
+    if "Row_ATS_Result" not in f_high.columns:
+        st.info("ATS data isn’t available yet (no betting lines attached).")
+    else:
+        ats = f_high.copy()
+        # Count only wins/losses; exclude pushes from denominator
+        ats["ats_win"]   = (ats["Row_ATS_Result"] == "ATS Win").astype(int)
+        ats["ats_valid"] = ats["Row_ATS_Result"].isin(["ATS Win", "ATS Loss"]).astype(int)
+
+        ats_mat = (
+            ats.groupby(["Team_Seed", "Opp_Seed"])
+            .agg(ats_wins=("ats_win", "sum"), ats_n=("ats_valid", "sum"))
+            .assign(ats_pct=lambda d: (d["ats_wins"] / d["ats_n"] * 100.0).where(d["ats_n"] > 0))
+            .reset_index()
+        )
+
+        pivot_ats_pct = (
+            ats_mat.pivot(index="Team_Seed", columns="Opp_Seed", values="ats_pct")
+            .sort_index().sort_index(axis=1)
+        )
+        pivot_ats_n = (
+            ats_mat.pivot(index="Team_Seed", columns="Opp_Seed", values="ats_n")
+            .sort_index().sort_index(axis=1)
+        )
+
+        c_ats1, c_ats2 = st.columns(2)
+        with c_ats1:
+            st.markdown("**ATS win % (higher-seed perspective)**")
+            st.dataframe(pivot_ats_pct.style.format(lambda v: "" if pd.isna(v) else f"{v:.1f}"), use_container_width=True)
+        with c_ats2:
+            st.markdown("**ATS sample size (valid bets only)**")
+            st.dataframe(pivot_ats_n.fillna(0).astype(int), use_container_width=True)
+
+        st.caption("ATS % excludes pushes from the denominator. Cells with no valid ATS bets are blank.")
