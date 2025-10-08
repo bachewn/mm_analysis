@@ -1,0 +1,2 @@
+Teams with better Team_NET vs Opp_NET have a 20.8% win rate (vs 79.2% when worse).
+Teams with higher Team_OE vs Opp_OE have a 73.0% win rate (vs 27.0% when lower).

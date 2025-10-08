@@ -14,7 +14,7 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 # COPY only code (no Excel)
-COPY mm_core.py fastapi_app.py streamlit_app.py betting_core.py ./
+COPY mm_core.py fastapi_app.py streamlit_app.py betting_core.py boxscore_core.py ./
 
 EXPOSE 8000
 EXPOSE 8501

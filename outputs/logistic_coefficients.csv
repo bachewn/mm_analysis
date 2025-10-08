@@ -1,0 +1,9 @@
+feature,coef,odds_ratio
+net_diff,1.445944857,4.245861981
+oe_diff,0.230770561,1.259570211
+net_seed_interaction,0.211916073,1.236044144
+oe_pace_interaction,0.11099852,1.117393254
+net_oe_interaction,-0.027704059,0.972676179
+seed_diff,-0.107378008,0.898186087
+pace_diff,-0.238563792,0.787758434
+net_pace_interaction,-0.332123941,0.717398402
